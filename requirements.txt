@@ -1,0 +1,14 @@
+# Prosody CKA analysis (plan.md)
+# Python 3.8+
+numpy>=1.21
+scipy>=1.7
+torch>=1.10
+torchaudio>=0.10
+soundfile>=0.11
+pandas>=1.3
+tqdm>=4.62
+# Optional: for loading HuggingFace Expresso
+datasets>=2.14
+# Optional: for specific models (install as needed)
+# transformers
+# huggingface_hub
