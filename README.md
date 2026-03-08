@@ -47,6 +47,10 @@ prosody-loss/
 ├── RUNBOOK.md          # Full pipeline runbook (manifests, models, CKA)
 ├── plan.md             # Datasets, model tiers, CKA strategy
 ├── requirements.txt
+├── manifests/          # Pre-built pair lists (Expresso, ESD) for --manifest
+│   ├── README.md
+│   ├── expresso_local_2.json
+│   └── esp_local.json
 ├── colm/               # Python package
 │   ├── config.py       # Paths (EXPRESSO_ROOT, ESD_ROOT) and constants
 │   ├── data/           # Expresso & ESD loaders, pair manifests
