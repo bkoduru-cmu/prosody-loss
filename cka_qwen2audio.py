@@ -1,13 +1,14 @@
 """
-CKA Analysis - Qwen2-Audio-7B-Instruct
+CKA Analysis + State Extraction - Qwen2-Audio-7B-Instruct
 Full paired dataset, resumable, saves incrementally after every pair.
+Also saves mean-pooled hidden states per clip for linear probing (no separate extraction pass needed).
 
 Usage: just run it. It picks up where it left off automatically.
 Set SAMPLES_PER_RUN = None to run all remaining pairs.
-Plot separately with: python plot_cka.py --results cka_qwen2audio_output/global_results.json
+Plot CKA  : python plot_cka.py --results cka_qwen2audio_output/global_results.json
+Train probe: python probe.py --states cka_qwen2audio_output/hidden_states.jsonl
 
-NOTE: get_features uses direct submodule calls (hooks don't work reliably
-for this model). Generation uses the separate chat pipeline.
+NOTE: get_features uses direct submodule calls (hooks don't work reliably for this model).
 """
 
 import os
@@ -21,11 +22,11 @@ from collections import defaultdict
 from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor
 
 # ─────────────────────────────────────────────
-# CONFIGURATION  ← only section you need to edit
+# CONFIGURATION  ← update paths for your setup
 # ─────────────────────────────────────────────
 MODEL_ID        = "Qwen/Qwen2-Audio-7B-Instruct"
-PAIRS_FILE      = "/path/to/expresso_full_pairs.json"   # ← update this
-CACHE_DIR       = "/path/to/huggingface/hub"            # ← update this
+PAIRS_FILE      = "/path/to/expresso_full_pairs.json"   # ← update
+CACHE_DIR       = "/path/to/huggingface/hub"            # ← update
 OUTPUT_DIR      = "cka_qwen2audio_output"
 SAMPLES_PER_RUN = None        # None = all remaining, or set e.g. 500
 EXCLUDED_STYLES = {"singing", "narration"}
@@ -35,6 +36,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 PROCESSED_IDS_FILE  = f"{OUTPUT_DIR}/processed_ids.json"
 GLOBAL_RESULTS_FILE = f"{OUTPUT_DIR}/global_results.json"
 OUTPUTS_FILE        = f"{OUTPUT_DIR}/model_outputs.json"
+STATES_FILE         = f"{OUTPUT_DIR}/hidden_states.jsonl"   # for probe.py
 
 # ─────────────────────────────────────────────
 # LOAD MODEL
@@ -119,7 +121,7 @@ def get_generation(audio_path):
     )
 
 # ─────────────────────────────────────────────
-# INCREMENTAL SAVE
+# INCREMENTAL SAVE (CKA + outputs)
 # ─────────────────────────────────────────────
 def save_all(processed_ids, global_results, all_outputs):
     with open(PROCESSED_IDS_FILE, "w") as f:
@@ -184,6 +186,16 @@ if os.path.exists(OUTPUTS_FILE):
     with open(OUTPUTS_FILE) as f:
         all_outputs = json.load(f)
 
+# Load already-seen clip IDs from states file (deduplication)
+seen_clips = set()
+if os.path.exists(STATES_FILE):
+    with open(STATES_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                seen_clips.add(json.loads(line)["clip_id"])
+    print(f"Already saved states for {len(seen_clips)} clips.")
+
 remaining = [p for p in all_pairs if p["pair_id"] not in processed_ids]
 batch     = remaining[:SAMPLES_PER_RUN]
 
@@ -199,45 +211,68 @@ else:
     # ─────────────────────────────────────────────
     errors = []
 
-    for sample in tqdm(batch, desc="CKA Qwen2-Audio"):
-        pair_key = sample["style_pair"]
-        try:
-            f1 = get_features(sample["audio1_path"])
-            f2 = get_features(sample["audio2_path"])
+    with open(STATES_FILE, "a") as states_f:
+        for sample in tqdm(batch, desc="CKA Qwen2-Audio"):
+            pair_key = sample["style_pair"]
+            try:
+                f1 = get_features(sample["audio1_path"])
+                f2 = get_features(sample["audio2_path"])
 
-            for idx, (h1, h2) in enumerate(zip(f1["enc"], f2["enc"])):
-                global_results[pair_key][f"enc_{idx}"].append(
-                    centered_kernel_alignment(h1, h2)
+                # --- CKA ---
+                for idx, (h1, h2) in enumerate(zip(f1["enc"], f2["enc"])):
+                    global_results[pair_key][f"enc_{idx}"].append(
+                        centered_kernel_alignment(h1, h2)
+                    )
+                global_results[pair_key]["projector"].append(
+                    centered_kernel_alignment(f1["prj"], f2["prj"])
                 )
-            global_results[pair_key]["projector"].append(
-                centered_kernel_alignment(f1["prj"], f2["prj"])
-            )
-            for idx, (h1, h2) in enumerate(zip(f1["dec"], f2["dec"])):
-                global_results[pair_key][f"dec_{idx}"].append(
-                    centered_kernel_alignment(h1, h2)
-                )
+                for idx, (h1, h2) in enumerate(zip(f1["dec"], f2["dec"])):
+                    global_results[pair_key][f"dec_{idx}"].append(
+                        centered_kernel_alignment(h1, h2)
+                    )
 
-            out1 = get_generation(sample["audio1_path"])
-            out2 = get_generation(sample["audio2_path"])
-            all_outputs.append({
-                "pair_id": sample["pair_id"],
-                "text":    sample["text"],
-                "style1":  sample["style1"],
-                "style2":  sample["style2"],
-                "output1": out1,
-                "output2": out2,
-            })
+                # --- Probe states (deduplicated per clip) ---
+                for audio_path, style, feats in [
+                    (sample["audio1_path"], sample["style1"], f1),
+                    (sample["audio2_path"], sample["style2"], f2),
+                ]:
+                    clip_id = os.path.basename(audio_path).replace(".wav", "")
+                    if clip_id not in seen_clips:
+                        record = {
+                            "clip_id": clip_id,
+                            "speaker": audio_path.split("/")[-4],
+                            "emotion": style,
+                            "utt_num": sample["sentence_id"],
+                            "enc": [h.mean(axis=0).tolist() for h in feats["enc"]],
+                            "prj": feats["prj"].mean(axis=0).tolist() if feats["prj"] is not None else None,
+                            "dec": [h.mean(axis=0).tolist() for h in feats["dec"]],
+                        }
+                        states_f.write(json.dumps(record) + "\n")
+                        states_f.flush()
+                        seen_clips.add(clip_id)
 
-            processed_ids.add(sample["pair_id"])
-            save_all(processed_ids, global_results, all_outputs)  # ← save after every pair
+                # --- Generations ---
+                out1 = get_generation(sample["audio1_path"])
+                out2 = get_generation(sample["audio2_path"])
+                all_outputs.append({
+                    "pair_id": sample["pair_id"],
+                    "text":    sample["text"],
+                    "style1":  sample["style1"],
+                    "style2":  sample["style2"],
+                    "output1": out1,
+                    "output2": out2,
+                })
 
-            del f1, f2
-            torch.cuda.empty_cache()
-            gc.collect()
+                processed_ids.add(sample["pair_id"])
+                save_all(processed_ids, global_results, all_outputs)
 
-        except Exception as e:
-            errors.append(f"pair_id={sample['pair_id']}: {e}")
-            print(f"  ❌ {errors[-1]}")
+                del f1, f2
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            except Exception as e:
+                errors.append(f"pair_id={sample['pair_id']}: {e}")
+                print(f"  ❌ {errors[-1]}")
 
     if errors:
         print(f"\n⚠️  {len(errors)} errors:")
@@ -248,5 +283,6 @@ print(f"\n{'='*50}")
 print(f"Progress : {len(processed_ids)}/{len(all_pairs)} "
       f"({100*len(processed_ids)/len(all_pairs):.1f}%)")
 print(f"Remaining: {len(all_pairs) - len(processed_ids)} pairs")
+print(f"Clips w/ states: {len(seen_clips)}")
 print(f"Output   : {OUTPUT_DIR}/")
 print(f"{'='*50}")
